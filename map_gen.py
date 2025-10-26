@@ -1,9 +1,10 @@
-"""Procedural map generation for The Depths of Ether."""
+"""Procedural map generation for The Depths of Ether MVP7."""
+
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from inventory import ITEM_LIBRARY
 
@@ -14,6 +15,57 @@ TILE_SAFE = "S"
 TILE_TREASURE = "$"
 TILE_STAIRS = ">"
 TILE_UNKNOWN = "?"
+TILE_SECRET = "+"
+
+
+DECOR_OBJECTS = {
+    "bones": "☠",
+    "torch": "†",
+    "ruin": "¤",
+    "crystal": "✶",
+}
+
+HAZARD_SYMBOLS = {
+    "gas": "~",
+    "cold": "*",
+    "curse": "!",
+}
+
+
+BIOME_THEMES: Sequence[Dict[str, object]] = (
+    {
+        "name": "Damp Cavern",
+        "floor": ".",
+        "wall": "#",
+        "decor": [DECOR_OBJECTS["bones"], DECOR_OBJECTS["torch"]],
+        "hazards": ["gas", "cold"],
+        "temperature": -2,
+    },
+    {
+        "name": "Forgotten Ruin",
+        "floor": ",",
+        "wall": "=",
+        "decor": [DECOR_OBJECTS["ruin"], DECOR_OBJECTS["bones"]],
+        "hazards": ["curse"],
+        "temperature": 0,
+    },
+    {
+        "name": "Corrupted Shrine",
+        "floor": ";",
+        "wall": "%",
+        "decor": [DECOR_OBJECTS["ruin"], DECOR_OBJECTS["torch"]],
+        "hazards": ["curse", "gas"],
+        "temperature": -1,
+    },
+    {
+        "name": "Crystal Depths",
+        "floor": "·",
+        "wall": "¤",
+        "decor": [DECOR_OBJECTS["crystal"], DECOR_OBJECTS["torch"]],
+        "hazards": ["cold"],
+        "temperature": -3,
+    },
+)
 
 
 @dataclass
@@ -46,7 +98,7 @@ class Room:
 class DungeonMap:
     """Holds the generated dungeon layout."""
 
-    def __init__(self, width: int = 40, height: int = 40, floor: int = 1):
+    def __init__(self, width: int = 48, height: int = 48, floor: int = 1):
         self.width = width
         self.height = height
         self.floor = floor
@@ -60,8 +112,14 @@ class DungeonMap:
         self.enemy_spawns: List[Tuple[str, Tuple[int, int]]] = []
         self.start_position: Tuple[int, int] = (1, 1)
         self.stairs_position: Tuple[int, int] = (width - 2, height - 2)
+        self.decor: Dict[Tuple[int, int], str] = {}
+        self.hazards: Dict[Tuple[int, int], str] = {}
+        self.hidden_doors: Set[Tuple[int, int]] = set()
+        self.secret_passages: Set[Tuple[int, int]] = set()
+        self.campfires: Set[Tuple[int, int]] = set()
+        self.biome: Dict[str, object] = {}
 
-    # -- Serialisation ---------------------------------------------------
+    # -- Serialisation -------------------------------------------------
     def to_dict(self) -> Dict[str, object]:
         return {
             "width": self.width,
@@ -75,12 +133,18 @@ class DungeonMap:
             ],
             "start": list(self.start_position),
             "stairs": list(self.stairs_position),
+            "decor": {f"{x},{y}": symbol for (x, y), symbol in self.decor.items()},
+            "hazards": {f"{x},{y}": tag for (x, y), tag in self.hazards.items()},
+            "hidden_doors": [list(pos) for pos in self.hidden_doors],
+            "secret_passages": [list(pos) for pos in self.secret_passages],
+            "campfires": [list(pos) for pos in self.campfires],
+            "biome": self.biome,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "DungeonMap":
-        width = int(data.get("width", 40))
-        height = int(data.get("height", 40))
+        width = int(data.get("width", 48))
+        height = int(data.get("height", 48))
         floor = int(data.get("floor", 1))
         dungeon = cls(width=width, height=height, floor=floor)
         rows = data.get("tiles", [])
@@ -100,9 +164,29 @@ class DungeonMap:
         ]
         dungeon.start_position = tuple(data.get("start", [1, 1]))  # type: ignore[arg-type]
         dungeon.stairs_position = tuple(data.get("stairs", [width - 2, height - 2]))  # type: ignore[arg-type]
+        dungeon.decor = {
+            (int(x), int(y)): symbol
+            for key, symbol in data.get("decor", {}).items()  # type: ignore[assignment]
+            for x, y in [key.split(",")]
+        }
+        dungeon.hazards = {
+            (int(x), int(y)): tag
+            for key, tag in data.get("hazards", {}).items()  # type: ignore[assignment]
+            for x, y in [key.split(",")]
+        }
+        dungeon.hidden_doors = {
+            tuple(pos) for pos in data.get("hidden_doors", [])  # type: ignore[arg-type]
+        }
+        dungeon.secret_passages = {
+            tuple(pos) for pos in data.get("secret_passages", [])  # type: ignore[arg-type]
+        }
+        dungeon.campfires = {
+            tuple(pos) for pos in data.get("campfires", [])  # type: ignore[arg-type]
+        }
+        dungeon.biome = dict(data.get("biome", {}))
         return dungeon
 
-    # -- Tile helpers ----------------------------------------------------
+    # -- Tile helpers --------------------------------------------------
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
 
@@ -115,8 +199,30 @@ class DungeonMap:
         if self.in_bounds(x, y):
             self.tiles[x][y] = value
 
+    def tile_glyph(self, x: int, y: int) -> str:
+        base = self.get_tile(x, y)
+        if (x, y) in self.campfires:
+            return "¤"
+        if (x, y) in self.decor:
+            return self.decor[(x, y)]
+        if (x, y) in self.hazards:
+            hazard = self.hazards[(x, y)]
+            return HAZARD_SYMBOLS.get(hazard, "!")
+        if (x, y) in self.hidden_doors and (x, y) in self.revealed:
+            return TILE_SECRET
+        if not self.biome:
+            return base
+        if base == TILE_FLOOR:
+            return str(self.biome.get("floor", TILE_FLOOR))
+        if base == TILE_WALL:
+            return str(self.biome.get("wall", TILE_WALL))
+        return base
+
     def is_walkable(self, x: int, y: int) -> bool:
-        return self.get_tile(x, y) in {TILE_FLOOR, TILE_SAFE, TILE_TREASURE, TILE_STAIRS}
+        tile = self.get_tile(x, y)
+        if (x, y) in self.hidden_doors and (x, y) not in self.revealed:
+            return False
+        return tile in {TILE_FLOOR, TILE_SAFE, TILE_TREASURE, TILE_STAIRS}
 
     def reveal(self, position: Tuple[int, int]) -> None:
         self.revealed.add(position)
@@ -132,6 +238,16 @@ class DungeonMap:
                     self.visible.add((x, y))
                     self.revealed.add((x, y))
 
+    def discover_hidden(self, x: int, y: int) -> bool:
+        """Reveal a hidden door if the player collides with it."""
+
+        if (x, y) not in self.hidden_doors:
+            return False
+        self.hidden_doors.remove((x, y))
+        self.set_tile(x, y, TILE_FLOOR)
+        self.revealed.add((x, y))
+        return True
+
     def place_item(self, position: Tuple[int, int], item_name: str) -> None:
         self.items.setdefault(position, []).append(item_name)
 
@@ -146,7 +262,7 @@ class DungeonMap:
                     tiles.append((x, y))
         return tiles
 
-    # -- Generation ------------------------------------------------------
+    # -- Generation ----------------------------------------------------
     def generate(self, rng: Optional[random.Random] = None) -> None:
         rng = rng or random.Random()
         self.tiles = [[TILE_WALL for _ in range(self.height)] for _ in range(self.width)]
@@ -156,10 +272,16 @@ class DungeonMap:
         self.items = {}
         self.enemy_spawns = []
         self.revealed.clear()
-        max_rooms = 12
+        self.decor.clear()
+        self.hazards.clear()
+        self.hidden_doors.clear()
+        self.secret_passages.clear()
+        self.campfires.clear()
+        self.biome = dict(self.pick_biome(rng))
+        max_rooms = 14
         min_size, max_size = 5, 9
 
-        for _ in range(max_rooms * 2):
+        for _ in range(max_rooms * 3):
             w = rng.randint(min_size, max_size)
             h = rng.randint(min_size, max_size)
             x = rng.randint(1, self.width - w - 2)
@@ -175,7 +297,6 @@ class DungeonMap:
             self.rooms.append(new_room)
 
         if not self.rooms:
-            # Guarantee at least one room exists.
             self.create_room(Room(1, 1, self.width // 2, self.height // 2))
             self.rooms.append(Room(1, 1, self.width // 2, self.height // 2))
 
@@ -183,18 +304,16 @@ class DungeonMap:
         self.stairs_position = self.rooms[-1].center()
         self.set_tile(*self.stairs_position, TILE_STAIRS)
 
-        # Safe room and treasure room selection.
-        if len(self.rooms) >= 2:
-            self.safe_rooms = [self.rooms[len(self.rooms) // 2]]
-            self.mark_room(self.safe_rooms[0], TILE_SAFE)
-        if len(self.rooms) >= 3:
-            treasure_room = self.rooms[-2]
-            self.treasure_rooms = [treasure_room]
-            self.mark_room(treasure_room, TILE_TREASURE)
-
+        self.create_additional_connections(rng)
+        self.decorate_rooms(rng)
         self.populate_items(rng)
         self.populate_enemy_spawns(rng)
         self.reveal_around(self.start_position, 6)
+
+    def pick_biome(self, rng: random.Random) -> Dict[str, object]:
+        index = min(len(BIOME_THEMES) - 1, (self.floor - 1) // 2)
+        base = BIOME_THEMES[index]
+        return dict(base)
 
     def create_room(self, room: Room) -> None:
         for x, y in room.tiles():
@@ -212,11 +331,54 @@ class DungeonMap:
 
     def carve_h(self, x1: int, x2: int, y: int) -> None:
         for x in range(min(x1, x2), max(x1, x2) + 1):
-            self.set_tile(x, y, TILE_FLOOR)
+            if self.get_tile(x, y) == TILE_WALL:
+                self.set_tile(x, y, TILE_FLOOR)
 
     def carve_v(self, y1: int, y2: int, x: int) -> None:
         for y in range(min(y1, y2), max(y1, y2) + 1):
-            self.set_tile(x, y, TILE_FLOOR)
+            if self.get_tile(x, y) == TILE_WALL:
+                self.set_tile(x, y, TILE_FLOOR)
+
+    def create_additional_connections(self, rng: random.Random) -> None:
+        if len(self.rooms) < 2:
+            return
+        for _ in range(len(self.rooms) // 2):
+            room_a, room_b = rng.sample(self.rooms, 2)
+            self.create_corridor(room_a.center(), room_b.center(), rng)
+        self.seed_hidden_doors(rng)
+
+    def decorate_rooms(self, rng: random.Random) -> None:
+        decor_choices = list(self.biome.get("decor", [])) or list(DECOR_OBJECTS.values())
+        hazard_choices = list(self.biome.get("hazards", [])) or ["gas"]
+        for room in self.rooms:
+            if rng.random() < 0.25:
+                position = (rng.randint(room.x1 + 1, room.x2 - 1), rng.randint(room.y1 + 1, room.y2 - 1))
+                self.decor[position] = rng.choice(decor_choices)
+            if rng.random() < 0.2:
+                position = (rng.randint(room.x1 + 1, room.x2 - 1), rng.randint(room.y1 + 1, room.y2 - 1))
+                hazard = rng.choice(hazard_choices)
+                self.hazards[position] = hazard
+            if rng.random() < 0.1:
+                self.campfires.add(room.center())
+        if self.rooms:
+            self.campfires.add(self.rooms[0].center())
+
+    def seed_hidden_doors(self, rng: random.Random) -> None:
+        attempts = 0
+        while attempts < 80:
+            attempts += 1
+            x = rng.randint(2, self.width - 3)
+            y = rng.randint(2, self.height - 3)
+            if self.get_tile(x, y) != TILE_WALL:
+                continue
+            neighbours = [
+                self.get_tile(x + dx, y + dy)
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            ]
+            if neighbours.count(TILE_FLOOR) >= 2:
+                self.hidden_doors.add((x, y))
+                if rng.random() < 0.5:
+                    self.secret_passages.add((x, y))
 
     def mark_room(self, room: Room, tile: str) -> None:
         for x, y in room.tiles():
@@ -225,21 +387,26 @@ class DungeonMap:
     def populate_items(self, rng: random.Random) -> None:
         loot_candidates = [name for name, data in ITEM_LIBRARY.items() if data.get("type") != "weapon"]
         for room in self.rooms:
-            if rng.random() < 0.35:
+            if rng.random() < 0.4:
                 x, y = room.center()
                 item = rng.choice(loot_candidates)
                 self.place_item((x, y), item)
-        # Guarantee at least one torch and food item.
         self.place_item(self.start_position, "Torch")
         self.place_item(self.start_position, "Bread")
 
     def populate_enemy_spawns(self, rng: random.Random) -> None:
         enemy_types = ["Rat", "Skeleton", "Ghost", "Shadowling", "Mimic"]
+        if self.floor >= 3:
+            enemy_types.append("Ether Guardian")
+        if self.floor >= 5:
+            enemy_types.append("Shadow Queen")
         for room in self.rooms[1:]:
-            if rng.random() < 0.6:
-                count = rng.randint(1, 2)
+            spawn_chance = 0.55 if room not in self.safe_rooms else 0.1
+            if rng.random() < spawn_chance:
+                count = rng.randint(1, 2 + self.floor // 3)
                 for _ in range(count):
-                    x = rng.randint(room.x1, room.x2)
-                    y = rng.randint(room.y1, room.y2)
+                    x = rng.randint(room.x1 + 1, room.x2 - 1)
+                    y = rng.randint(room.y1 + 1, room.y2 - 1)
                     enemy_type = rng.choice(enemy_types)
                     self.enemy_spawns.append((enemy_type, (x, y)))
+
